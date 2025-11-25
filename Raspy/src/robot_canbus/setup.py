@@ -24,6 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'can_ps4_bridge = robot_canbus.can_ps4_bridge:main',
         ],
     },
 )
