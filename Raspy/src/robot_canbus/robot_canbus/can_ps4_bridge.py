@@ -33,7 +33,7 @@ def send_pwm(m1, m2, m3, m4):
     bus.send(msg12)
     bus.send(msg34)
 
-    print(f"[CAN] PWM -> M1:{m1}  M2:{m2}  M3:{m3}  M4:{m4}")
+    #print(f"[CAN] PWM -> M1:{m1}  M2:{m2}  M3:{m3}  M4:{m4}")
 
 
 class CANPS4Bridge(Node):
@@ -46,6 +46,69 @@ class CANPS4Bridge(Node):
 
         self.get_logger().info("Nodo CAN-PS4 iniciado ✔ (con lógica de movimiento)")
         self.last_share = 0
+        
+    def compute_pwm(self, LX, R2, L2, turbo_btn, turn_right, turn_left):
+
+        # ================================
+        # CONFIGURACIÓN
+        # ================================
+        #print("Buttons:", f"L2={L2}", f"R2={R2}", f"Turbo={turbo_btn}", f"TurnR={turn_right}", f"TurnL={turn_left}")
+        MAX_PWM = 50       # Limite principal (puedes cambiarlo)
+        TURBO    = 20      # Extra cuando se presiona Square
+        TURN_PWM = 30      # PWM para giro brusco
+
+        # ================================
+        # 1) Dirección principal: adelante / atrás
+        # ================================
+        if R2 and not L2:
+            direction = 1
+        elif L2 and not R2:
+            direction = -1
+        else:
+            direction = 0
+
+        # NO avanzar si no hay dirección:
+        base = direction * MAX_PWM
+
+        # ================================
+        # 2) Turbo
+        # ================================
+        if turbo_btn:
+            base = min(MAX_PWM, base + TURBO)
+
+        # ================================
+        # 3) Dirección proporcional LX
+        # LX = -1.0 (izq) → 1.0 (der)
+        # ================================
+        # reducción/ incremento proporcional
+        left_factor  = 1.0 - LX
+        right_factor = 1.0 + LX
+
+        pwm_left  = base * left_factor
+        pwm_right = base * right_factor
+
+        # ================================
+        # 4) Giros bruscos (L1 / R1)
+        # PRIORIDAD TOTAL
+        # ================================
+        if turn_right and not turn_left:
+            pwm_left  =  TURN_PWM
+            pwm_right = -TURN_PWM
+
+        elif turn_left and not turn_right:
+            pwm_left  = -TURN_PWM
+            pwm_right =  TURN_PWM
+
+        # ================================
+        # 5) Limitar PWM
+        # ================================
+        pwm_left  = int(max(-MAX_PWM, min(MAX_PWM, pwm_left)))
+        pwm_right = int(max(-MAX_PWM, min(MAX_PWM, pwm_right)))
+        print("pwm_left, pwm_right:", pwm_left, pwm_right)
+
+        return pwm_left, pwm_right
+
+
         
     def ps4_callback(self, msg):
         data = msg.data
@@ -64,12 +127,13 @@ class CANPS4Bridge(Node):
 
         L2 = data[4]
         R2 = data[5]
-
+        #print(f"L2: {L2}, R2: {R2}")
         # Botones 
-        Square  = data[6]
-        Cross   = data[7]
-        Circle  = data[8]
-        Triangle= data[9]
+        Cross   = data[6]
+        Circle  = data[7]
+        Triangle= data[8]
+        Square  = data[9]
+        
         L1      = data[10]
         R1      = data[11]
         Share   = data[12]
@@ -82,7 +146,7 @@ class CANPS4Bridge(Node):
         DOWN    = data[18]
         LEFT    = data[19]
         RIGHT   = data[20] if len(data) > 20 else 0
-        
+        #print("All buttons:", f"Square={Square}", f"Cross={Cross}", f"Circle={Circle}", f"Triangle={Triangle}",)
         # ================================
         # PUBLICAR COMANDO DE STREAMING
         # ================================
@@ -102,17 +166,16 @@ class CANPS4Bridge(Node):
         # LOGICA DE MOVIMIENTO
         # ================================
         
-        # LY controla velocidad
-        # LX controla giro
-        # R2 puede ser turbo 
-        # L2 puede ser freno 
+        left_pwm, right_pwm = self.compute_pwm(
+            LX=LX,
+            R2=R2,
+            L2=L2,
+            turbo_btn=Square,
+            turn_right=R1,
+            turn_left=L1,
+        )
 
-        left_pwm  = (LY * 100) + (LX * 50)
-        right_pwm = (LY * 100) - (LX * 50)
 
-        # Limitar
-        left_pwm  = max(-100, min(100, left_pwm))
-        right_pwm = max(-100, min(100, right_pwm))
 
         # ================================
         # Enviar a los 4 motores
@@ -120,7 +183,7 @@ class CANPS4Bridge(Node):
         send_pwm(left_pwm, right_pwm, left_pwm, right_pwm)
 
         # Debug
-        print(f"[PS4] LX:{LX:.2f} LY:{LY:.2f}  -> L:{left_pwm:.0f} R:{right_pwm:.0f}")
+        #print(f"[PS4] LX:{LX:.2f} LY:{LY:.2f}  -> L:{left_pwm:.0f} R:{right_pwm:.0f}")
 
 
 def main(args=None):

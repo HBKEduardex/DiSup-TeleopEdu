@@ -24,6 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'status_node = robot_status.status_node:main',
         ],
     },
 )
