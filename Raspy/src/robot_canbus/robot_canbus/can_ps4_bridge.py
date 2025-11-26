@@ -1,22 +1,26 @@
+#!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float32MultiArray
+from std_msgs.msg import Float32MultiArray, String
 import can
 
-
-# ================================================
-# CONFIGuración del bus CAN
-# ================================================
+# ================================
+# CONFIG CAN (4 motores)
+# ================================
 bus = can.interface.Bus(channel='can0', bustype='socketcan')
 
 
 def send_pwm(m1, m2, m3, m4):
     """Enviar 4 PWM por CAN (-100 a 100)"""
 
-    m1 = max(-100, min(100, int(m1)))
-    m2 = max(-100, min(100, int(m2)))
-    m3 = max(-100, min(100, int(m3)))
-    m4 = max(-100, min(100, int(m4)))
+    def clamp100(v):
+        v = int(v)
+        return max(-100, min(100, v))
+
+    m1 = clamp100(m1)
+    m2 = clamp100(m2)
+    m3 = clamp100(m3)
+    m4 = clamp100(m4)
 
     msg12 = can.Message(
         arbitration_id=0x120,
@@ -33,33 +37,44 @@ def send_pwm(m1, m2, m3, m4):
     bus.send(msg12)
     bus.send(msg34)
 
-    #print(f"[CAN] PWM -> M1:{m1}  M2:{m2}  M3:{m3}  M4:{m4}")
-
 
 class CANPS4Bridge(Node):
     def __init__(self):
         super().__init__('can_ps4_bridge')
 
         # Recibe TODOS los datos del mando PS4
-        self.create_subscription(Float32MultiArray, '/Data_PS4', self.ps4_callback, 10)
-        self.pub_stream = self.create_publisher(Float32MultiArray, '/stream_cmd', 10)
+        self.create_subscription(Float32MultiArray, '/Data_PS4',
+                                 self.ps4_callback, 10)
 
-        self.get_logger().info("Nodo CAN-PS4 iniciado ✔ (con lógica de movimiento)")
+        # Para video_tx (toggle streaming)
+        self.pub_stream = self.create_publisher(Float32MultiArray,
+                                                '/stream_cmd', 10)
+
+        # Para UART (S / H hacia ESP32)
+        self.pub_uart = self.create_publisher(String, '/uart_cmd', 10)
+
+        self.get_logger().info(
+            "Nodo CAN-PS4 listo (4 motores, giro sobre eje, stream + UART)"
+        )
+
+        # Estados para detectar flancos
         self.last_share = 0
-        
-    def compute_pwm(self, LX, R2, L2, turbo_btn, turn_right, turn_left):
+        self.last_btn_S = 0     # Triangle → 'S'
+        self.last_btn_H = 0     # Circle → 'H'
 
-        # ================================
-        # CONFIGURACIÓN
-        # ================================
-        #print("Buttons:", f"L2={L2}", f"R2={R2}", f"Turbo={turbo_btn}", f"TurnR={turn_right}", f"TurnL={turn_left}")
-        MAX_PWM = 50       # Limite principal (puedes cambiarlo)
-        TURBO    = 20      # Extra cuando se presiona Square
-        TURN_PWM = 30      # PWM para giro brusco
+    # ================================
+    # LÓGICA DE PWM (skid-steer)
+    # ================================
+    def compute_pwm(self, LX, R2, L2):
+        """
+        LX: joystick izq X  (-1 izq, +1 der)
+        R2 / L2: adelante / atrás (0 ó 1)
+        """
 
-        # ================================
-        # 1) Dirección principal: adelante / atrás
-        # ================================
+        MAX_PWM = 50      # velocidad base
+        SPIN_PWM = 70     # para giro puro
+
+        # 1) Dirección adelante / atrás
         if R2 and not L2:
             direction = 1
         elif L2 and not R2:
@@ -67,49 +82,34 @@ class CANPS4Bridge(Node):
         else:
             direction = 0
 
-        # NO avanzar si no hay dirección:
-        base = direction * MAX_PWM
+        # 2) Giro puro sobre el eje (sin R2/L2)
+        if direction == 0 and abs(LX) > 0.2:
+            spin = int(SPIN_PWM * abs(LX))
+            if LX > 0:  # giro a la derecha
+                left_pwm = spin      # izquierdas adelante
+                right_pwm = -spin    # derechas atrás
+            else:       # LX < 0 giro a la izquierda
+                left_pwm = -spin
+                right_pwm = spin
+        else:
+            # 3) Avance normal con giro suave
+            base = direction * MAX_PWM
+            k = 0.7
+            left_factor = 1.0 - k * LX
+            right_factor = 1.0 + k * LX
 
-        # ================================
-        # 2) Turbo
-        # ================================
-        if turbo_btn:
-            base = min(MAX_PWM, base + TURBO)
+            left_pwm = base * left_factor
+            right_pwm = base * right_factor
 
-        # ================================
-        # 3) Dirección proporcional LX
-        # LX = -1.0 (izq) → 1.0 (der)
-        # ================================
-        # reducción/ incremento proporcional
-        left_factor  = 1.0 - LX
-        right_factor = 1.0 + LX
+        # Limitar
+        left_pwm = int(max(-MAX_PWM, min(MAX_PWM, left_pwm)))
+        right_pwm = int(max(-MAX_PWM, min(MAX_PWM, right_pwm)))
 
-        pwm_left  = base * left_factor
-        pwm_right = base * right_factor
+        return left_pwm, right_pwm
 
-        # ================================
-        # 4) Giros bruscos (L1 / R1)
-        # PRIORIDAD TOTAL
-        # ================================
-        if turn_right and not turn_left:
-            pwm_left  =  TURN_PWM
-            pwm_right = -TURN_PWM
-
-        elif turn_left and not turn_right:
-            pwm_left  = -TURN_PWM
-            pwm_right =  TURN_PWM
-
-        # ================================
-        # 5) Limitar PWM
-        # ================================
-        pwm_left  = int(max(-MAX_PWM, min(MAX_PWM, pwm_left)))
-        pwm_right = int(max(-MAX_PWM, min(MAX_PWM, pwm_right)))
-        print("pwm_left, pwm_right:", pwm_left, pwm_right)
-
-        return pwm_left, pwm_right
-
-
-        
+    # ================================
+    # CALLBACK PS4
+    # ================================
     def ps4_callback(self, msg):
         data = msg.data
 
@@ -117,9 +117,7 @@ class CANPS4Bridge(Node):
             self.get_logger().warn("Mensaje PS4 incompleto.")
             return
 
-        # ================================
-        # Mapeo del array
-        # ================================
+        # Mapeo (coincide con teleop_ps4_multiarray.py de la laptop) :contentReference[oaicite:1]{index=1}
         LX = data[0]
         LY = data[1]
         RX = data[2]
@@ -127,63 +125,59 @@ class CANPS4Bridge(Node):
 
         L2 = data[4]
         R2 = data[5]
-        #print(f"L2: {L2}, R2: {R2}")
-        # Botones 
-        Cross   = data[6]
-        Circle  = data[7]
-        Triangle= data[8]
-        Square  = data[9]
-        
-        L1      = data[10]
-        R1      = data[11]
-        Share   = data[12]
-        Options = data[13]
-        L3      = data[14]
-        R3      = data[15]
-        PS      = data[16]
 
-        UP      = data[17]
-        DOWN    = data[18]
-        LEFT    = data[19]
-        RIGHT   = data[20] if len(data) > 20 else 0
-        #print("All buttons:", f"Square={Square}", f"Cross={Cross}", f"Circle={Circle}", f"Triangle={Triangle}",)
-        # ================================
-        # PUBLICAR COMANDO DE STREAMING
-        # ================================
+        # Botones
+        Square   = data[6]
+        Cross    = data[7]
+        Circle   = data[8]
+        Triangle = data[9]
+        L1       = data[10]
+        R1       = data[11]
+        Share    = data[12]
+        Options  = data[13]
+        L3       = data[14]
+        R3       = data[15]
+        PS       = data[16]
+        UP       = data[17]
+        DOWN     = data[18]
+        LEFT     = data[19]
+        RIGHT    = data[20] if len(data) > 20 else 0
+
+        # ---------- 1) STREAMING (Share) ----------
         if Share == 1 and self.last_share == 0:
-            # flanco ascendente
             cmd = Float32MultiArray()
-            cmd.data = [1.0]     # float
+            cmd.data = [1.0]
             self.pub_stream.publish(cmd)
             self.last_share = 1
-            print("SHARE pressed → TOGGLE STREAM")
-
+            self.get_logger().info("SHARE → toggle streaming")
         elif Share == 0:
-            # reset del estado
             self.last_share = 0
 
-        # ================================
-        # LOGICA DE MOVIMIENTO
-        # ================================
-        
-        left_pwm, right_pwm = self.compute_pwm(
-            LX=LX,
-            R2=R2,
-            L2=L2,
-            turbo_btn=Square,
-            turn_right=R1,
-            turn_left=L1,
-        )
+        # ---------- 2) UART: 'S' y 'H' ----------
+        # Ejemplo: Triangle = 'S', Circle = 'H'
+        if Triangle == 1 and self.last_btn_S == 0:
+            msg_s = String()
+            msg_s.data = 'S'
+            self.pub_uart.publish(msg_s)
+            self.get_logger().info("UART CMD → 'S'")
+            self.last_btn_S = 1
+        elif Triangle == 0:
+            self.last_btn_S = 0
 
+        if Circle == 1 and self.last_btn_H == 0:
+            msg_h = String()
+            msg_h.data = 'H'
+            self.pub_uart.publish(msg_h)
+            self.get_logger().info("UART CMD → 'H'")
+            self.last_btn_H = 1
+        elif Circle == 0:
+            self.last_btn_H = 0
 
+        # ---------- 3) MOVIMIENTO 4 MOTORES ----------
+        left_pwm, right_pwm = self.compute_pwm(LX=LX, R2=R2, L2=L2)
 
-        # ================================
-        # Enviar a los 4 motores
-        # ================================
-        send_pwm(left_pwm, right_pwm, left_pwm, right_pwm)
-
-        # Debug
-        #print(f"[PS4] LX:{LX:.2f} LY:{LY:.2f}  -> L:{left_pwm:.0f} R:{right_pwm:.0f}")
+        # M1,M2 = lado izquierdo ; M3,M4 = lado derecho
+        send_pwm(left_pwm, left_pwm, right_pwm, right_pwm)
 
 
 def main(args=None):
